@@ -1,0 +1,310 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+
+class GasStorageContractPricer:
+
+
+    def __init__(self):
+        self.tolerance = 1e-6  # For floating point comparisons
+
+    def price_contract(self,
+                      injection_dates: List[str],
+                      withdrawal_dates: List[str],
+                      injection_prices: List[float],
+                      withdrawal_prices: List[float],
+                      injection_volumes: List[float],
+                      withdrawal_volumes: List[float],
+                      max_storage_volume: float,
+                      storage_cost_per_unit_per_day: float,
+                      injection_rate_per_day: float = None,
+                      withdrawal_rate_per_day: float = None) -> Dict:
+
+
+        # Input validation
+        warnings = []
+        is_feasible = True
+
+        # Convert dates to datetime objects
+        inj_dates = [datetime.strptime(d, '%Y-%m-%d') for d in injection_dates]
+        with_dates = [datetime.strptime(d, '%Y-%m-%d') for d in withdrawal_dates]
+
+        # Validate input lengths
+        assert len(injection_dates) == len(injection_prices) == len(injection_volumes), \
+            "Injection dates, prices, and volumes must have same length"
+        assert len(withdrawal_dates) == len(withdrawal_prices) == len(withdrawal_volumes), \
+            "Withdrawal dates, prices, and volumes must have same length"
+
+        # Check volume balance
+        total_injection = sum(injection_volumes)
+        total_withdrawal = sum(withdrawal_volumes)
+        if abs(total_injection - total_withdrawal) > self.tolerance:
+            warnings.append(f"Volume imbalance: Injected {total_injection}, Withdrawn {total_withdrawal}")
+            is_feasible = False
+
+        # Create transaction dataframe
+        transactions = []
+
+        # Add injections
+        for date, price, volume in zip(inj_dates, injection_prices, injection_volumes):
+            transactions.append({
+                'date': date,
+                'type': 'injection',
+                'volume': volume,
+                'price': price,
+                'cashflow': -volume * price  # Negative = cash outflow
+            })
+
+        # Add withdrawals
+        for date, price, volume in zip(with_dates, withdrawal_prices, withdrawal_volumes):
+            transactions.append({
+                'date': date,
+                'type': 'withdrawal',
+                'volume': volume,
+                'price': price,
+                'cashflow': volume * price  # Positive = cash inflow
+            })
+
+        # Sort by date
+        df_transactions = pd.DataFrame(transactions).sort_values('date').reset_index(drop=True)
+
+        # Calculate storage profile over time
+        storage_profile = self._calculate_storage_profile(df_transactions)
+
+        # Check storage capacity constraint
+        max_stored = storage_profile['volume_stored'].max()
+        if max_stored > max_storage_volume + self.tolerance:
+            warnings.append(f"Storage capacity exceeded: Max {max_stored} > Capacity {max_storage_volume}")
+            is_feasible = False
+
+        # Check rate constraints if provided
+        if injection_rate_per_day is not None:
+            max_inj_volume = max(injection_volumes) if injection_volumes else 0
+            if max_inj_volume > injection_rate_per_day + self.tolerance:
+                warnings.append(f"Injection rate exceeded: {max_inj_volume} > {injection_rate_per_day}")
+                is_feasible = False
+
+        if withdrawal_rate_per_day is not None:
+            max_with_volume = max(withdrawal_volumes) if withdrawal_volumes else 0
+            if max_with_volume > withdrawal_rate_per_day + self.tolerance:
+                warnings.append(f"Withdrawal rate exceeded: {max_with_volume} > {withdrawal_rate_per_day}")
+                is_feasible = False
+
+        # Calculate storage costs
+        total_storage_cost = self._calculate_storage_costs(
+            storage_profile, storage_cost_per_unit_per_day
+        )
+
+        # Calculate total values
+        total_purchase_cost = -df_transactions[df_transactions['type'] == 'injection']['cashflow'].sum()
+        total_sale_revenue = df_transactions[df_transactions['type'] == 'withdrawal']['cashflow'].sum()
+
+        # Net contract value = Revenue - Purchase Cost - Storage Cost
+        contract_value = total_sale_revenue - total_purchase_cost - total_storage_cost
+
+        return {
+            'contract_value': round(contract_value, 2),
+            'total_purchase_cost': round(total_purchase_cost, 2),
+            'total_sale_revenue': round(total_sale_revenue, 2),
+            'total_storage_cost': round(total_storage_cost, 2),
+            'intrinsic_value': round(total_sale_revenue - total_purchase_cost, 2),
+            'detailed_cashflows': df_transactions,
+            'storage_profile': storage_profile,
+            'max_storage_used': round(max_stored, 2),
+            'is_feasible': is_feasible,
+            'warnings': warnings
+        }
+
+    def _calculate_storage_profile(self, df_transactions: pd.DataFrame) -> pd.DataFrame:
+        """Calculate daily storage levels"""
+        if df_transactions.empty:
+            return pd.DataFrame(columns=['date', 'volume_stored'])
+
+        # Create daily timeline
+        start_date = df_transactions['date'].min()
+        end_date = df_transactions['date'].max()
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+        storage_profile = pd.DataFrame({'date': date_range})
+        storage_profile['volume_stored'] = 0.0
+
+        # Calculate cumulative storage
+        cumulative_volume = 0
+        for date in date_range:
+            day_transactions = df_transactions[df_transactions['date'] == date]
+
+            for _, txn in day_transactions.iterrows():
+                if txn['type'] == 'injection':
+                    cumulative_volume += txn['volume']
+                else:  # withdrawal
+                    cumulative_volume -= txn['volume']
+
+            storage_profile.loc[storage_profile['date'] == date, 'volume_stored'] = cumulative_volume
+
+        # Forward fill for days without transactions
+        storage_profile['volume_stored'] = storage_profile['volume_stored'].replace(0, np.nan)
+        storage_profile['volume_stored'] = storage_profile['volume_stored'].fillna(method='ffill').fillna(0)
+
+        return storage_profile
+
+    def _calculate_storage_costs(self, storage_profile: pd.DataFrame,
+                                 cost_per_unit_per_day: float) -> float:
+        """Calculate total storage costs over the holding period"""
+        if storage_profile.empty:
+            return 0.0
+
+        # Storage cost = sum of (volume stored each day * daily cost rate)
+        total_cost = (storage_profile['volume_stored'] * cost_per_unit_per_day).sum()
+        return total_cost
+
+
+# ============================================================================
+# TEST CASES
+# ============================================================================
+
+def run_test_cases():
+    """Test the pricing model with various scenarios"""
+
+    pricer = GasStorageContractPricer()
+
+    print("=" * 80)
+    print("NATURAL GAS STORAGE CONTRACT PRICING MODEL - TEST CASES")
+    print("=" * 80)
+
+    # TEST CASE 1: Simple Buy Low, Sell High
+    print("\n" + "=" * 80)
+    print("TEST CASE 1: Simple Buy Low, Sell High Strategy")
+    print("=" * 80)
+    print("\nScenario: Buy 10,000 units at $3/unit in summer, sell at $5/unit in winter")
+
+    result1 = pricer.price_contract(
+        injection_dates=['2024-07-01'],
+        withdrawal_dates=['2024-12-01'],
+        injection_prices=[3.0],
+        withdrawal_prices=[5.0],
+        injection_volumes=[10000],
+        withdrawal_volumes=[10000],
+        max_storage_volume=15000,
+        storage_cost_per_unit_per_day=0.01,
+        injection_rate_per_day=15000,
+        withdrawal_rate_per_day=15000
+    )
+
+    print_results(result1)
+
+    # TEST CASE 2: Multiple Injections and Withdrawals
+    print("\n" + "=" * 80)
+    print("TEST CASE 2: Multiple Injection and Withdrawal Dates")
+    print("=" * 80)
+    print("\nScenario: Gradual accumulation and strategic withdrawals")
+
+    result2 = pricer.price_contract(
+        injection_dates=['2024-04-01', '2024-05-01', '2024-06-01'],
+        withdrawal_dates=['2024-11-01', '2024-12-01'],
+        injection_prices=[2.5, 2.8, 3.0],
+        withdrawal_prices=[4.5, 5.0],
+        injection_volumes=[5000, 3000, 2000],
+        withdrawal_volumes=[6000, 4000],
+        max_storage_volume=12000,
+        storage_cost_per_unit_per_day=0.008,
+        injection_rate_per_day=6000,
+        withdrawal_rate_per_day=7000
+    )
+
+    print_results(result2)
+
+    # TEST CASE 3: High Storage Costs
+    print("\n" + "=" * 80)
+    print("TEST CASE 3: High Storage Costs Impact")
+    print("=" * 80)
+    print("\nScenario: Same as Test 1 but with high storage costs")
+
+    result3 = pricer.price_contract(
+        injection_dates=['2024-07-01'],
+        withdrawal_dates=['2024-12-01'],
+        injection_prices=[3.0],
+        withdrawal_prices=[5.0],
+        injection_volumes=[10000],
+        withdrawal_volumes=[10000],
+        max_storage_volume=15000,
+        storage_cost_per_unit_per_day=0.05,  # Much higher storage cost
+        injection_rate_per_day=15000,
+        withdrawal_rate_per_day=15000
+    )
+
+    print_results(result3)
+
+    # TEST CASE 4: Capacity Constraint Violation
+    print("\n" + "=" * 80)
+    print("TEST CASE 4: Storage Capacity Constraint Test")
+    print("=" * 80)
+    print("\nScenario: Attempting to store more than capacity")
+
+    result4 = pricer.price_contract(
+        injection_dates=['2024-06-01', '2024-07-01'],
+        withdrawal_dates=['2024-12-01'],
+        injection_prices=[2.5, 2.8],
+        withdrawal_prices=[5.0],
+        injection_volumes=[8000, 7000],  # Total 15,000
+        withdrawal_volumes=[15000],
+        max_storage_volume=10000,  # Only 10,000 capacity!
+        storage_cost_per_unit_per_day=0.01,
+        injection_rate_per_day=10000,
+        withdrawal_rate_per_day=20000
+    )
+
+    print_results(result4)
+
+    # TEST CASE 5: Short-term Trading
+    print("\n" + "=" * 80)
+    print("TEST CASE 5: Short-term Trading Strategy")
+    print("=" * 80)
+    print("\nScenario: Quick turnaround with minimal storage time")
+
+    result5 = pricer.price_contract(
+        injection_dates=['2024-09-01'],
+        withdrawal_dates=['2024-09-15'],
+        injection_prices=[3.5],
+        withdrawal_prices=[4.2],
+        injection_volumes=[5000],
+        withdrawal_volumes=[5000],
+        max_storage_volume=10000,
+        storage_cost_per_unit_per_day=0.02,
+        injection_rate_per_day=10000,
+        withdrawal_rate_per_day=10000
+    )
+
+    print_results(result5)
+
+
+def print_results(result: Dict):
+    """Pretty print pricing results"""
+
+    print(f"\n{'Feasibility Check:':<30} {'✓ FEASIBLE' if result['is_feasible'] else '✗ NOT FEASIBLE'}")
+
+    if result['warnings']:
+        print(f"\n{'Warnings:':<30}")
+        for warning in result['warnings']:
+            print(f"  - {warning}")
+
+    print(f"\n{'FINANCIAL SUMMARY':^80}")
+    print("-" * 80)
+    print(f"{'Total Purchase Cost:':<30} ${result['total_purchase_cost']:>15,.2f}")
+    print(f"{'Total Sale Revenue:':<30} ${result['total_sale_revenue']:>15,.2f}")
+    print(f"{'Intrinsic Value (no storage):':<30} ${result['intrinsic_value']:>15,.2f}")
+    print(f"{'Total Storage Cost:':<30} ${result['total_storage_cost']:>15,.2f}")
+    print("-" * 80)
+    print(f"{'NET CONTRACT VALUE:':<30} ${result['contract_value']:>15,.2f}")
+    print("=" * 80)
+
+    print(f"\n{'OPERATIONAL SUMMARY':^80}")
+    print("-" * 80)
+    print(f"{'Max Storage Used:':<30} {result['max_storage_used']:>15,.2f} units")
+
+    print("\n\nDetailed Transactions:")
+    print(result['detailed_cashflows'].to_string(index=False))
+
+
+if __name__ == "__main__":
+    run_test_cases()
